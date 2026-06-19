@@ -5,6 +5,7 @@ import path from "path";
 import { isHoliday } from "@hyunbinseo/holidays-kr";
 import { getAvailableDevices, recordRental, markReturned, extendRental, getDueToday, getOverdueOnDate, appendNetworkAccessList, getLastNetworkCheckDate } from "@/lib/sheets";
 import { deviceListBlocks } from "@/lib/blocks";
+import { fetchLatestIosVersion, loadVersionState, saveVersionState, compareVersions } from "@/lib/version-checker";
 
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID ?? "U07SRDNADGB";
 
@@ -338,6 +339,53 @@ const app = new App({
     }
   }, { timezone: "Asia/Seoul" });
 
+  // ── iOS 버전 체크 스케줄러 (매일 오전 10시) ──
+  cron.schedule("0 10 * * *", async () => {
+    try {
+      const latest = await fetchLatestIosVersion();
+      if (!latest) return;
+
+      const state = loadVersionState();
+      const prev = state.ios.latest;
+
+      if (prev && compareVersions(latest, prev) <= 0) {
+        // 버전 변화 없음 — 미확인 상태로 3일 경과 시 재알림
+        if (state.ios.notifiedAt && !state.ios.confirmedAt) {
+          const days = Math.floor((Date.now() - new Date(state.ios.notifiedAt).getTime()) / 86400000);
+          if (days >= 3) {
+            await sendIosVersionAlert(app, latest, prev);
+            state.ios.notifiedAt = getKSTDate();
+            saveVersionState(state);
+          }
+        }
+        return;
+      }
+
+      // 새 버전 감지
+      await sendIosVersionAlert(app, latest, prev);
+      state.ios = { latest, notifiedAt: getKSTDate(), confirmedAt: null };
+      saveVersionState(state);
+    } catch (e) {
+      console.error("[iOS 버전 체크 오류]", e);
+    }
+  }, { timezone: "Asia/Seoul" });
+
+  // ── iOS 버전 확인 완료 버튼 ──
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  app.action("confirm_os_version", async ({ ack, body, client, action }: any) => {
+    await ack();
+    const data = JSON.parse(action.value);
+    const state = loadVersionState();
+    state.ios.confirmedAt = getKSTDate();
+    saveVersionState(state);
+    await client.chat.update({
+      channel: body.container.channel_id,
+      ts: body.container.message_ts,
+      blocks: [{ type: "section", text: { type: "mrkdwn", text: `:action_check: *iOS ${data.version} 확인 완료*\n<@${body.user.id}>이(가) 확인했어요.` } }],
+      text: `iOS ${data.version} 확인 완료`,
+    });
+  });
+
   // ── 내부망 접속 목록 시트 추가 버튼 ──
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   app.action("generate_network_list", async ({ ack, respond }: any) => {
@@ -544,4 +592,27 @@ function vacationNoticeBlocks() {
   return [
     { type: "section", text: { type: "mrkdwn", text: `🏖️ *관리자가 ${dateText} 휴가 중이에요.*\n대여 / 반납 / 연장 요청은 <#C04PNLHHYRG> 채널에 남겨주세요!` } },
   ];
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function sendIosVersionAlert(app: any, newVersion: string, prevVersion: string) {
+  const value = JSON.stringify({ version: newVersion });
+  const isResend = !!prevVersion && prevVersion === newVersion;
+  const text = isResend
+    ? `📱 *iOS ${newVersion} 확인 미완료 재알림*\n테스트 단말 업데이트 여부를 아직 확인하지 않으셨어요.`
+    : `📱 *새 iOS 버전이 출시됐어요*\n${prevVersion || "?"} → *${newVersion}*\n\n테스트 단말 업데이트 여부를 확인해주세요.`;
+  await app.client.chat.postMessage({
+    channel: ADMIN_USER_ID,
+    blocks: [
+      { type: "section", text: { type: "mrkdwn", text } },
+      { type: "actions", elements: [{
+        type: "button",
+        text: { type: "plain_text", text: "✅ 확인 완료" },
+        style: "primary",
+        action_id: "confirm_os_version",
+        value,
+      }]},
+    ],
+    text,
+  });
 }
