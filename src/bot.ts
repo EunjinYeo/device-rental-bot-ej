@@ -1,5 +1,7 @@
 import { App } from "@slack/bolt";
 import cron from "node-cron";
+import fs from "fs";
+import path from "path";
 import { isHoliday } from "@hyunbinseo/holidays-kr";
 import { getAvailableDevices, recordRental, markReturned, extendRental, getDueToday, getOverdueOnDate, appendNetworkAccessList, getLastNetworkCheckDate } from "@/lib/sheets";
 import { deviceListBlocks } from "@/lib/blocks";
@@ -44,8 +46,12 @@ const app = new App({
     if (message.channel_type !== "im") return;
     const text: string = message.text ?? "";
     if (/빌려|대여|목록|리스트/.test(text)) {
-      const devices = await getAvailableDevices();
-      await say({ blocks: deviceListBlocks(devices), text: "대여 가능한 단말 목록입니다." });
+      if (isAdminVacation()) {
+        await say({ blocks: vacationNoticeBlocks(), text: "관리자 휴가 중입니다." });
+      } else {
+        const devices = await getAvailableDevices();
+        await say({ blocks: deviceListBlocks(devices), text: "대여 가능한 단말 목록입니다." });
+      }
     } else {
       await say({
         blocks: [{ type: "section", text: { type: "mrkdwn", text: "안녕하세요! 👋 `빌려줘` 또는 `목록`이라고 보내주시면 대여 가능한 단말을 보여드릴게요." } }],
@@ -105,6 +111,10 @@ const app = new App({
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   app.action("request_return", async ({ ack, body, client, action }: any) => {
     await ack();
+    if (isAdminVacation()) {
+      await client.chat.update({ channel: body.container.channel_id, ts: body.container.message_ts, blocks: vacationNoticeBlocks(), text: "관리자 휴가 중입니다." });
+      return;
+    }
     const data = JSON.parse(action.value);
     await client.chat.update({ channel: body.container.channel_id, ts: body.container.message_ts, text: `반납 요청 완료!`, blocks: [{ type: "section", text: { type: "mrkdwn", text: `:action_paperpencil: *반납 신청 완료!*\n반납 요청이 전달됐어요. 단말을 <@${ADMIN_USER_ID}> 자리로 가져다주세요!\n관리자 확인 후 반납이 완료돼요.\n• 반납 단말 : ${data.model_name}(${data.asset_no})` } }] });
     await client.chat.postMessage({ channel: ADMIN_USER_ID, blocks: returnRequestBlocks(body.user.id, data), text: `반납 확인 요청: ${data.user_name} / ${data.model_name}` });
@@ -137,6 +147,10 @@ const app = new App({
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   app.action("request_extension", async ({ ack, body, client, action }: any) => {
     await ack();
+    if (isAdminVacation()) {
+      await client.chat.update({ channel: body.container.channel_id, ts: body.container.message_ts, blocks: vacationNoticeBlocks(), text: "관리자 휴가 중입니다." });
+      return;
+    }
     const data = JSON.parse(action.value);
     await client.views.open({ trigger_id: body.trigger_id, view: extensionModal(data, body.container.message_ts, body.container.channel_id) });
   });
@@ -254,16 +268,20 @@ const app = new App({
   cron.schedule("0 11 * * *", async () => {
     try {
       const today = getKSTDate();
-      const todayDate = new Date(`${today}T00:00:00+0900`);
-      const todayHoliday = await isHoliday(todayDate);
-      if (todayDate.getDay() === 0 || todayDate.getDay() === 6 || todayHoliday) return;
+      const todayUTC = new Date(`${today}T00:00:00Z`);
+      const todayHoliday = await isHoliday(new Date(`${today}T00:00:00+0900`));
+      console.log(`[연체알림] 실행 today=${today} day=${todayUTC.getUTCDay()} holiday=${todayHoliday}`);
+      if (todayUTC.getUTCDay() === 0 || todayUTC.getUTCDay() === 6 || todayHoliday) return;
 
-      const yesterday = new Date(todayDate);
-      yesterday.setDate(yesterday.getDate() - 1);
-      const prevBizDay = await getPreviousBusinessDay(yesterday);
-      const prevBizDayStr = prevBizDay.toLocaleString("sv-SE", { timeZone: "Asia/Seoul" }).slice(0, 10);
+      const yesterdayUTC = new Date(todayUTC);
+      yesterdayUTC.setUTCDate(yesterdayUTC.getUTCDate() - 1);
+      const prevBizDay = await getPreviousBusinessDay(yesterdayUTC);
+      const prevBizDayStr = prevBizDay.toISOString().slice(0, 10);
+      console.log(`[연체알림] 조회 날짜: ${prevBizDayStr}`);
 
       const overdueList = await getOverdueOnDate(prevBizDayStr);
+      console.log(`[연체알림] 미반납 건수: ${overdueList.length}`);
+      if (overdueList.length === 0) return;
       for (const rental of overdueList) {
         const btnValue = JSON.stringify({ asset_no: rental["자산번호"], user_id: rental["Slack_ID"], user_name: rental["대여자"] ?? "", model_name: rental["모델명"] || rental["자산번호"] });
         await app.client.chat.postMessage({
@@ -278,6 +296,12 @@ const app = new App({
           text: `:action_warning: 단말이 아직 반납되지 않았어요.`,
         });
       }
+      const lines = overdueList.map((r) => `• <@${r["Slack_ID"]}> — ${r["모델명"]}(${r["자산번호"]})`).join("\n");
+      await app.client.chat.postMessage({
+        channel: ADMIN_USER_ID,
+        blocks: [{ type: "section", text: { type: "mrkdwn", text: `:action_warning: *반납 미완료 알림*\n반납 예정일이 지난 미반납 건이 있어요.\n${lines}` } }],
+        text: `:action_warning: 반납 미완료 알림 — ${overdueList.length}건`,
+      });
     } catch (e) {
       console.error("[연체 알림 오류]", e);
     }
@@ -356,10 +380,11 @@ function getKSTDate(): string {
 async function getPreviousBusinessDay(date: Date): Promise<Date> {
   const d = new Date(date);
   while (true) {
-    const dow = d.getDay();
-    const holiday = await isHoliday(new Date(`${d.toLocaleString("sv-SE", { timeZone: "Asia/Seoul" }).slice(0, 10)}T00:00:00+0900`));
+    const dateStr = d.toISOString().slice(0, 10);
+    const dow = d.getUTCDay();
+    const holiday = await isHoliday(new Date(`${dateStr}T00:00:00+0900`));
     if (dow !== 0 && dow !== 6 && !holiday) break;
-    d.setDate(d.getDate() - 1);
+    d.setUTCDate(d.getUTCDate() - 1);
   }
   return d;
 }
@@ -486,5 +511,37 @@ function extensionApprovedBlocks(modelName: string, assetNo: string, newEndDate:
       { type: "button", text: { type: "plain_text", text: "반납하기" }, style: "primary", action_id: "request_return", value: returnValue },
       { type: "button", text: { type: "plain_text", text: "연장하기" }, action_id: "request_extension", value: returnValue },
     ]},
+  ];
+}
+
+const VACATION_FILE = path.join(process.cwd(), "vacation.json");
+
+interface VacationPeriod {
+  from: string;
+  to: string;
+}
+
+function loadVacations(): VacationPeriod[] {
+  try {
+    return JSON.parse(fs.readFileSync(VACATION_FILE, "utf-8"));
+  } catch {
+    return [];
+  }
+}
+
+function getActiveVacation(): VacationPeriod | null {
+  const today = getKSTDate();
+  return loadVacations().find(v => today >= v.from && today <= v.to) ?? null;
+}
+
+function isAdminVacation(): boolean {
+  return getActiveVacation() !== null;
+}
+
+function vacationNoticeBlocks() {
+  const v = getActiveVacation();
+  const dateText = v ? `${v.from} ~ ${v.to}` : "휴가 중";
+  return [
+    { type: "section", text: { type: "mrkdwn", text: `🏖️ *관리자가 ${dateText} 휴가 중이에요.*\n대여 / 반납 / 연장 요청은 <#C04PNLHHYRG> 채널에 남겨주세요!` } },
   ];
 }
